@@ -218,6 +218,21 @@ def validate_session_model_metadata(
     return validated_model, validated_effort
 
 
+def require_template_visible(agent: Any, user_id: str | None) -> None:
+    """404 a user-installed template for anyone but the user who installed it.
+
+    Mirrors the ``GET /v1/agents`` listing filter, so an agent id guessed or
+    copied from another user cannot be bound either. Operator templates
+    (``created_by`` NULL) and session-scoped agents pass through; the latter
+    are authorized against their owning session instead.
+    """
+    # Single-user schedules store the local owner as None; installs stamp "local".
+    if user_id is None and local_single_user_enabled():
+        user_id = RESERVED_USER_LOCAL
+    if agent.session_id is None and agent.created_by is not None and agent.created_by != user_id:
+        raise OmnigentError(f"Agent not found: {agent.id!r}", code=ErrorCode.NOT_FOUND)
+
+
 async def validate_session_agent(
     *,
     user_id: str | None,
@@ -233,6 +248,7 @@ async def validate_session_agent(
             f"Agent not found: {agent_id!r}",
             code=ErrorCode.NOT_FOUND,
         )
+    require_template_visible(agent, user_id)
 
     # Session-scoped agents belong to a specific session. The caller must have
     # at least READ access to that owning session — otherwise they can execute

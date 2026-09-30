@@ -32,6 +32,9 @@ export interface AvailableAgent {
   // same-named `omnigent run` upload, but lets a newer upload supersede a
   // user-registered template (builtin === false).
   builtin?: boolean;
+  // Installed by this user (`omnigent agent add`). Wins its name over any
+  // same-named agent discovered from recent sessions. Catalog rows only.
+  installed?: boolean;
   // True when the server declares this agent's harness generic-ACP (harness
   // catalog ``integration_mode === "acp-subprocess"``) — a builtin ACP CLI row
   // (devin / grok) or a user-configured ``acp:<slug>`` agent. Stamped on by
@@ -101,6 +104,7 @@ interface BuiltinAgentWire {
   // True only for server-seeded built-ins (deterministic id). Absent on
   // older servers, where every catalog row degrades to a protected entry.
   builtin?: boolean;
+  installed?: boolean;
   created_at?: number | null;
 }
 
@@ -142,6 +146,7 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
     // sensitive to absent-vs-undefined. Logic that reads builtin treats
     // undefined as "protected" (same as true), so omission is safe.
     ...(a.builtin !== undefined ? { builtin: a.builtin } : {}),
+    ...(a.installed ? { installed: true } : {}),
     ...(a.created_at !== undefined ? { created_at: a.created_at } : {}),
   }));
 }
@@ -271,13 +276,18 @@ function mergeAvailableAgents(
   catalog: AvailableAgent[],
   discovered: DiscoveredSessionAgent[],
 ): AvailableAgent[] {
-  // Seeded built-ins are emitted verbatim and protected; user-registered
-  // templates seed the newest-wins buckets so an upload can supersede them.
-  // `builtin !== false` keeps both true (seeded) and undefined (older server,
-  // no flag) protected — only an explicit false marks a supersedable
-  // user-registered template.
-  const seeded = dedupeNativeAgents(catalog.filter((a) => a.builtin !== false));
-  const userTemplates = catalog.filter((a) => a.builtin === false);
+  // Seeded built-ins and installed agents are emitted verbatim and protected;
+  // other user-registered templates seed the newest-wins buckets so an upload
+  // can supersede them. `builtin !== false` keeps both true (seeded) and
+  // undefined (older server, no flag) protected. Installed agents skip the
+  // native dedupe, which matches on harness and would fold an installed
+  // claude-native agent into the Claude Code row.
+  const isProtected = (a: AvailableAgent) => a.builtin !== false || a.installed === true;
+  const seeded = [
+    ...dedupeNativeAgents(catalog.filter((a) => a.builtin !== false && a.installed !== true)),
+    ...catalog.filter((a) => a.installed === true),
+  ];
+  const userTemplates = catalog.filter((a) => !isProtected(a));
   const catalogIds = new Set(catalog.map((a) => a.id));
   const seededNames = new Set(seeded.map((a) => agentRootName(a.name)));
   const hasKiroBuiltin = seeded.some((a) => nativeCodingAgentForAvailableAgent(a)?.key === "kiro");

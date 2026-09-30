@@ -253,13 +253,11 @@ def register_agent_routes(
                 "X-Agent-Version": str(agent.version),
                 "X-Agent-Name": agent.name,
                 # Provenance for the runner's env-expansion decision:
-                # session-scoped agents are
-                # tenant-uploaded and must NOT have ${VAR} expanded
-                # against the runner process env; template agents
-                # (session_id is None) are operator-authored and may.
-                # The runner fails safe (treats a missing header as
-                # session-scoped → no expansion).
-                "X-Agent-Session-Scoped": "true" if agent.session_id is not None else "false",
+                # tenant input (session-scoped or user-installed) must NOT
+                # have ${VAR} expanded against the runner process env; only
+                # operator templates may. The runner fails safe (treats a
+                # missing header as session-scoped → no expansion).
+                "X-Agent-Session-Scoped": "false" if agent.operator_authored else "true",
             },
         )
 
@@ -373,7 +371,7 @@ def register_agent_routes(
             # (session_id is None) may expand ${VAR} against the server
             # env; tenant session-scoped bundles must not.
             agent_cache.replace(
-                agent.id, new_loc, bundle_bytes, expand_env=agent.session_id is None
+                agent.id, new_loc, bundle_bytes, expand_env=agent.operator_authored
             )
 
         return _to_agent_object(updated, agent_cache, mcp_servers_editable=True)

@@ -754,6 +754,49 @@ describe("useAvailableAgents", () => {
     expect(enrichCalls).toEqual([]);
   });
 
+  it("keeps an installed agent over a newer same-named session copy", async () => {
+    // `omnigent agent add` is the source of truth for its name: a later
+    // session copy must not shadow it, and a native harness must not fold it
+    // into the matching built-in harness row.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          {
+            id: "ag_claude",
+            name: "claude-native-ui",
+            harness: "claude-native",
+            builtin: true,
+            created_at: 100,
+          },
+          {
+            id: "ag_orion",
+            name: "orion",
+            harness: "claude-native",
+            builtin: false,
+            installed: true,
+            created_at: 200,
+          },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: sessionResponse({
+        object: "list",
+        data: [{ id: "ag_orion_clone", name: "orion", created_at: 300 }],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_orion"]);
+    expect(result.current.data?.[1].installed).toBe(true);
+  });
+
   it("keeps a user-registered template when no newer upload exists", async () => {
     // Mirror image of the supersede case: the template is the only agent-a,
     // and a same-named session that simply bound it must not duplicate it.

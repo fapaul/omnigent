@@ -111,7 +111,7 @@ class AgentCache:
             against the server env leaks secrets into a spec-controlled
             MCP/LLM connection. Callers pass
             ``expand_env=True`` only for operator-authored template
-            agents (``Agent.session_id is None`` — ``--agent`` /
+            agents (``Agent.operator_authored`` — ``--agent`` /
             built-ins). The default is fail-safe: a caller that
             forgets the flag gets no expansion (a template agent may
             fail to resolve, loudly) rather than a silent leak.

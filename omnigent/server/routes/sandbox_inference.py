@@ -18,6 +18,7 @@ from omnigent.inference_config import (
 )
 from omnigent.server.auth import LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
+from omnigent.server.routes._session_create_validation import require_template_visible
 
 
 def inference_service(request: Request) -> Any:
@@ -171,6 +172,7 @@ def create_sandbox_inference_router(
             agent = await asyncio.to_thread(agent_store.get, agent_id)
             if agent is None:
                 raise HTTPException(status_code=404, detail="Agent not found")
+            require_template_visible(agent, user_id)
             if agent.session_id:
                 await require_access_and_level(
                     user_id, agent.session_id, LEVEL_READ, permission_store, conversation_store
@@ -180,7 +182,7 @@ def create_sandbox_inference_router(
                     agent_cache.load,
                     agent.id,
                     agent.bundle_location,
-                    expand_env=agent.session_id is None,
+                    expand_env=agent.operator_authored,
                 )
             ).spec
             harness = actual_harness(spec, harness)

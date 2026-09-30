@@ -312,6 +312,10 @@ class SqlAgent(OmnigentBase):
         # do — kind is included so the seek skips same-named session copies
         # straight to the template row.
         Index("ix_agents_name", "workspace_id", "name", "kind", "id"),
+        # Backs the picker's "global + mine" template listing and the
+        # per-owner install lookup. ``kind`` leads so the seek skips the
+        # one-row-per-session copies that dominate this table.
+        Index("ix_agents_kind_owner_name", "workspace_id", "kind", "created_by", "name"),
     )
 
 

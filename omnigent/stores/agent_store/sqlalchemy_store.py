@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import builtins
 
-from sqlalchemy import and_, asc, desc, or_, select
+from sqlalchemy import ColumnElement, and_, asc, desc, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -24,6 +24,13 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Agent, PagedList
 from omnigent.stores.agent_store import AgentStore
+
+
+def _owned_by(created_by: str | None) -> ColumnElement[bool]:
+    """Exact-owner predicate; ``None`` matches only unowned (operator) rows."""
+    if created_by is None:
+        return SqlAgent.created_by.is_(None)
+    return SqlAgent.created_by == created_by
 
 
 class SqlAlchemyAgentStore(AgentStore):
@@ -122,6 +129,7 @@ class SqlAlchemyAgentStore(AgentStore):
         name: str,
         bundle_location: str,
         description: str | None = None,
+        created_by: str | None = None,
     ) -> Agent:
         """
         Register a new template agent in the database.
@@ -133,18 +141,21 @@ class SqlAlchemyAgentStore(AgentStore):
         :param bundle_location: Artifact store key for the bundle,
             e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
         :param description: Optional free-text description.
+        :param created_by: Installing user, or ``None`` for an operator
+            template.
         :returns: The newly created :class:`Agent`.
         """
         created_at = now_epoch()
 
         def write(session: Session) -> Agent:
-            # Template names are unique within a workspace. This can't be a
-            # partial unique index (MySQL has none), so enforce it here.
+            # Template names are unique per owner within a workspace. This
+            # can't be a partial unique index (MySQL has none), so enforce it here.
             conflict = session.execute(
                 select(SqlAgent.id).where(
                     SqlAgent.workspace_id == current_workspace_id(),
-                    SqlAgent.name == name,
                     SqlAgent.kind == encode_agent_kind("template"),
+                    _owned_by(created_by),
+                    SqlAgent.name == name,
                 )
             ).first()
             if conflict is not None:
@@ -161,6 +172,7 @@ class SqlAlchemyAgentStore(AgentStore):
                 version=1,
                 kind=encode_agent_kind("template"),
                 description=description,
+                created_by=created_by,
             )
             session.add(row)
             return sql_agent_to_entity(row)
@@ -187,23 +199,25 @@ class SqlAlchemyAgentStore(AgentStore):
             session_id = self._session_id_for_agent(agent_id)
         return sql_agent_to_entity(row, session_id=session_id)
 
-    def get_by_name(self, name: str) -> Agent | None:
+    def get_by_name(self, name: str, created_by: str | None = None) -> Agent | None:
         """
-        Look up a registered template agent by its unique name.
+        Look up a registered template agent by name within one owner.
 
         Only agents with ``kind = 'template'`` are returned; session-scoped
         copies bound to a specific conversation are excluded.
 
-        :param name: The template agent's unique name,
-            e.g. ``"code-assistant"``.
+        :param name: The template agent's name, e.g. ``"code-assistant"``.
+        :param created_by: Owner to match exactly; ``None`` matches only
+            unowned (operator) templates.
         :returns: The :class:`Agent` if found, otherwise ``None``.
         """
         with self._session("select_agent_by_name") as session:
             row = session.execute(
                 select(SqlAgent).where(
                     SqlAgent.workspace_id == current_workspace_id(),
-                    SqlAgent.name == name,
                     SqlAgent.kind == encode_agent_kind("template"),
+                    _owned_by(created_by),
+                    SqlAgent.name == name,
                 )
             ).scalar_one_or_none()
             return sql_agent_to_entity(row) if row else None
@@ -214,12 +228,13 @@ class SqlAlchemyAgentStore(AgentStore):
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        viewer: str | None = None,
     ) -> PagedList[Agent]:
         """
-        List registered template agents with cursor-based pagination.
+        List the template agents *viewer* can see, with cursor pagination.
 
-        Only agents with ``kind = 'template'`` are returned; session-scoped
-        copies are excluded.
+        Unowned (operator) templates plus *viewer*'s own; session-scoped
+        copies and other users' templates are excluded.
 
         :param limit: Maximum number of agents to return.
         :param after: Cursor agent ID; return agents appearing
@@ -228,12 +243,19 @@ class SqlAlchemyAgentStore(AgentStore):
         :param before: Cursor agent ID; return agents appearing
             before this agent in sort order.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
+        :param viewer: Caller whose own templates are included; ``None``
+            lists only unowned templates.
         :returns: A :class:`PagedList` of :class:`Agent` objects.
         """
         with self._session("list_agents") as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            is_template = SqlAgent.kind == encode_agent_kind("template")
+            # Owner filter sits in ``is_template`` so the cursor subqueries
+            # below resolve only against rows this viewer can see.
+            is_template = and_(
+                SqlAgent.kind == encode_agent_kind("template"),
+                _owned_by(None) if viewer is None else or_(_owned_by(None), _owned_by(viewer)),
+            )
             in_workspace = SqlAgent.workspace_id == current_workspace_id()
             stmt = select(SqlAgent).where(in_workspace, is_template)
             if after:

@@ -569,3 +569,34 @@ def test_session_scoped_agent_resolves_to_root_split_db(tmp_path: Path) -> None:
     fetched = agent_store.get(created.agent.id)
     assert fetched is not None
     assert fetched.session_id == mint_id
+
+
+def test_templates_are_scoped_per_owner(agent_store: SqlAlchemyAgentStore) -> None:
+    """Names are unique per owner; lookups and listing never cross owners."""
+    agent_store.create("0a" * 16, "orion", "x/1")
+    agent_store.create("0b" * 16, "orion", "x/2", created_by="alice")
+    agent_store.create("0c" * 16, "orion", "x/3", created_by="bob")
+    with pytest.raises(IntegrityError):
+        agent_store.create("0d" * 16, "orion", "x/4", created_by="alice")
+
+    assert agent_store.get_by_name("orion").id == "0a" * 16
+    assert agent_store.get_by_name("orion", created_by="alice").id == "0b" * 16
+    assert agent_store.get_by_name("orion", created_by="carol") is None
+
+    def visible(viewer: str | None) -> set[str]:
+        return {a.id for a in agent_store.list(limit=100, viewer=viewer).data}
+
+    assert visible(None) == {"0a" * 16}
+    assert visible("alice") == {"0a" * 16, "0b" * 16}
+    assert visible("bob") == {"0a" * 16, "0c" * 16}
+
+
+def test_list_cursor_ignores_other_owners(agent_store: SqlAlchemyAgentStore) -> None:
+    """Paging a viewer's list never lands on or past another user's row."""
+    for i, owner in enumerate([None, "bob", "alice", None]):
+        agent_store.create(f"{i:032x}", f"a{i}", f"x/{i}", created_by=owner)
+    first = agent_store.list(limit=1, viewer="alice")
+    rest = agent_store.list(limit=100, after=first.last_id, viewer="alice")
+    ids = [a.id for a in first.data + rest.data]
+    assert f"{1:032x}" not in ids
+    assert len(ids) == 3

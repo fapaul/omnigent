@@ -1845,6 +1845,7 @@ class ConversationStore(ABC):
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
+        new_agent_created_by: str | None = None,
     ) -> Conversation:
         """
         Rebind a session in place to a different (cloned) agent.
@@ -1861,10 +1862,9 @@ class ConversationStore(ABC):
         state). The whole operation is atomic: any failure rolls back
         and the session stays on its current agent.
 
-        The replacement agent's ``created_by`` is left unset, so it is
-        admin-only to mutate until a full switch implementation assigns
-        the session owner (the delete is also not yet reference-safe for
-        an agent shared via reuse or named sub-agents).
+        The replacement agent's ``created_by`` is the session owner, never
+        the (possibly shared-editor) caller. The delete is not yet
+        reference-safe for an agent shared via reuse or named sub-agents.
 
         :param conversation_id: Session to switch, e.g.
             ``"conv_abc123"``.
@@ -1895,6 +1895,8 @@ class ConversationStore(ABC):
             switching away from, stamped as
             :data:`SWITCH_PREVIOUS_BUILTIN_LABEL_KEY` for a one-click
             "Switch back". ``None`` leaves it unset.
+        :param new_agent_created_by: Session owner stamped on the new
+            agent, or ``None`` in single-user mode / when unknown.
         :returns: The updated :class:`Conversation`.
         :raises LookupError: If no conversation with *conversation_id*
             exists.

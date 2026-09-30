@@ -3675,6 +3675,16 @@ def register_core_routes(
                 f"Agent not found or not bindable: {body.agent_id!r}",
                 code=ErrorCode.NOT_FOUND,
             )
+        from omnigent.server.routes._session_create_validation import require_template_visible
+
+        require_template_visible(target_agent, user_id)
+        # A user-installed target must also belong to the session owner: a shared
+        # editor must not swap their own agent's code into the owner's runner.
+        session_owner = await asyncio.to_thread(
+            conversation_store.get_session_owner, session_id, owner_only=True
+        )
+        if permission_store is not None:
+            require_template_visible(target_agent, session_owner)
 
         # Reject a no-op switch to the built-in the session is already running:
         # its session-scoped clone shares the built-in's ``bundle_location``, so
@@ -3756,7 +3766,7 @@ def register_core_routes(
         previous_builtin_id: str | None = None
         _after: str | None = None
         while True:
-            _page = await asyncio.to_thread(agent_store.list, 100, _after)
+            _page = await asyncio.to_thread(agent_store.list, 100, _after, viewer=user_id)
             previous_builtin_id = next(
                 (a.id for a in _page.data if a.bundle_location == current_agent.bundle_location),
                 None,
@@ -3779,6 +3789,9 @@ def register_core_routes(
                 carry_history_into_native=carry_history_into_native,
                 presentation_labels=presentation_labels,
                 previous_builtin_id=previous_builtin_id,
+                # The session owner, not the caller: a shared editor may switch,
+                # but must not end up owning code that runs in the owner's runner.
+                new_agent_created_by=session_owner,
             )
         except LookupError as exc:
             raise OmnigentError(

@@ -51,13 +51,14 @@ class _AgentStore:
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        viewer: str | None = None,
     ) -> PagedList[Agent]:
         """Return the built-in (session_id is None) agents.
 
         :param limit: Max agents (ignored — stubs are small).
         :returns: A PagedList of the template agents.
         """
-        del after, before, order
+        del after, before, order, viewer
         builtins = [a for a in self._agents.values() if a.session_id is None][:limit]
         return PagedList(data=builtins, first_id=None, last_id=None, has_more=False)
 
@@ -83,6 +84,13 @@ class _ConversationStore:
         """:returns: The conversation if present, else None."""
         return self._convs.get(conversation_id)
 
+    session_owner: str | None = None
+
+    def get_session_owner(self, conversation_id: str, *, owner_only: bool = False) -> str | None:
+        """:returns: :attr:`session_owner` (the route stamps it on the new agent)."""
+        del conversation_id, owner_only
+        return self.session_owner
+
     def set_session_todos(self, conversation_id: str, todos: list[dict[str, Any]]) -> bool:
         self.todo_updates.append(todos)
         return conversation_id in self._convs
@@ -99,6 +107,7 @@ class _ConversationStore:
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
+        new_agent_created_by: str | None = None,
     ) -> Conversation:
         """Record the call and return the updated conversation.
 
@@ -125,6 +134,7 @@ class _ConversationStore:
                 "carry_history_into_native": carry_history_into_native,
                 "presentation_labels": presentation_labels,
                 "previous_builtin_id": previous_builtin_id,
+                "new_agent_created_by": new_agent_created_by,
             }
         )
         src = self._convs.get(conversation_id)
@@ -285,6 +295,7 @@ def _build_app(
     conv_store: _ConversationStore,
     agent_store: _AgentStore,
     file_store: _AttachmentFileStore | None = None,
+    **router_kwargs: Any,
 ) -> FastAPI:
     """Build a FastAPI app mounting the sessions router + error handler.
 
@@ -297,6 +308,7 @@ def _build_app(
         conversation_store=conv_store,  # type: ignore[arg-type]
         agent_store=agent_store,  # type: ignore[arg-type]
         file_store=file_store,  # type: ignore[arg-type]
+        **router_kwargs,
     )
     app = FastAPI()
 
@@ -1058,3 +1070,58 @@ def test_switch_checks_attachment_history_before_mutation(
         assert source.agent_id == _CURRENT.id
     else:
         assert len(conv_store.switch_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_switch_to_installed_agent_requires_session_owner(
+    monkeypatch: pytest.MonkeyPatch, db_uri: str
+) -> None:
+    """A shared editor can't switch the owner's session to the editor's own
+    installed agent (that would run the editor's code in the owner's runner),
+    while the owner can, and the new clone is stamped with the owner."""
+    from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, UnifiedAuthProvider
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    conv_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    bobs = Agent(
+        id="0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+        created_at=1,
+        name="orion",
+        bundle_location="bundle/bob-orion",
+        created_by="bob@example.com",
+    )
+    alices = Agent(
+        id="0a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+        created_at=1,
+        name="orion",
+        bundle_location="bundle/alice-orion",
+        created_by="alice@example.com",
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.grant("alice@example.com", conv_id, LEVEL_OWNER)
+    permissions.grant("bob@example.com", conv_id, LEVEL_EDIT)
+    conv_store = _ConversationStore(conversations={conv_id: _conv()})
+    conv_store.session_owner = "alice@example.com"
+    agent_store = _AgentStore({_CURRENT.id: _CURRENT, bobs.id: bobs, alices.id: alices})
+    _patch_family_helpers(monkeypatch, same_family=True, native=False, labels={})
+    client = TestClient(
+        _build_app(
+            conv_store,
+            agent_store,
+            permission_store=permissions,
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        )
+    )
+    url = f"/v1/sessions/{conv_id}/switch-agent"
+
+    resp = client.post(
+        url, json={"agent_id": bobs.id}, headers={"X-Forwarded-Email": "bob@example.com"}
+    )
+    assert resp.status_code == 404, resp.text
+    assert conv_store.switch_calls == []
+
+    resp = client.post(
+        url, json={"agent_id": alices.id}, headers={"X-Forwarded-Email": "alice@example.com"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert conv_store.switch_calls[0]["new_agent_created_by"] == "alice@example.com"

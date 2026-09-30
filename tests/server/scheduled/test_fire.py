@@ -50,6 +50,11 @@ class _FakeAgent:
     bundle_location: str | None = None
     session_id: str | None = None
     name: str = "assistant"
+    created_by: str | None = None
+
+    @property
+    def operator_authored(self) -> bool:
+        return self.session_id is None and self.created_by is None
 
 
 class FakeAgentStore:

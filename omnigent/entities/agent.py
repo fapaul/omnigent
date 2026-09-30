@@ -26,10 +26,12 @@ class Agent:
     :param description: Optional free-text description of the agent.
     :param updated_at: Unix epoch timestamp of the last update, or
         ``None`` if the agent has never been updated.
-    :param created_by: Identity of the user who created a session-scoped
-        agent. Gates agent-code mutation to its owner. ``None`` for template
-        agents, single-user mode, and rows created before this field existed;
-        an unowned session-scoped agent is admin-only to mutate.
+    :param created_by: Identity of the user who created the agent. Gates
+        session-scoped agent mutation to its owner, and marks a template as
+        user-installed (``omnigent agent add``) rather than operator-seeded.
+        ``None`` for operator templates, single-user mode, and rows created
+        before this field existed; an unowned session-scoped agent is
+        admin-only to mutate.
     """
 
     id: str
@@ -41,6 +43,16 @@ class Agent:
     updated_at: int | None = None
     session_id: str | None = None  # owning conversation id; None for template agents
     created_by: str | None = None
+
+    @property
+    def operator_authored(self) -> bool:
+        """Whether the server operator wrote this spec, so ``${VAR}`` may expand.
+
+        Only unowned templates qualify (built-ins, ``--agent``). Session-scoped
+        agents and user-installed templates are tenant input: expanding their
+        ``${VAR}`` against the server env would leak server secrets.
+        """
+        return self.session_id is None and self.created_by is None
 
 
 @dataclass

@@ -34,11 +34,12 @@ class AgentStore(ABC):
         name: str,
         bundle_location: str,
         description: str | None = None,
+        created_by: str | None = None,
     ) -> Agent:
         """
         Register a new template agent. Name must be unique among
-        template agents and raises if a template with that name
-        already exists.
+        the owner's template agents and raises if that owner already
+        has a template with that name.
 
         :param agent_id: Pre-generated unique agent identifier,
             e.g. ``"ag_0f1a2b3c..."``. Caller generates this so
@@ -49,6 +50,9 @@ class AgentStore(ABC):
             e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
         :param description: Optional free-text description of the
             agent's purpose.
+        :param created_by: Installing user for a user-owned template
+            (``omnigent agent add``); ``None`` for an operator template
+            visible to everyone.
         :returns: The newly created :class:`Agent`.
         """
         ...
@@ -65,12 +69,13 @@ class AgentStore(ABC):
         ...
 
     @abstractmethod
-    def get_by_name(self, name: str) -> Agent | None:
+    def get_by_name(self, name: str, created_by: str | None = None) -> Agent | None:
         """
-        Look up a registered template agent by its unique name.
+        Look up a registered template agent by name within one owner.
 
-        :param name: The template agent's unique name,
-            e.g. ``"code-assistant"``.
+        :param name: The template agent's name, e.g. ``"code-assistant"``.
+        :param created_by: Owner to match exactly; ``None`` matches only
+            unowned (operator) templates.
         :returns: The :class:`Agent` if found, otherwise ``None``.
         """
         ...
@@ -82,9 +87,13 @@ class AgentStore(ABC):
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        viewer: str | None = None,
     ) -> PagedList[Agent]:
         """
-        List registered template agents with cursor-based pagination.
+        List the template agents *viewer* can see, with cursor pagination.
+
+        That is every unowned (operator) template plus the templates
+        *viewer* installed; other users' templates are never returned.
 
         ``order`` controls the sort direction on ``created_at``
         (``"desc"`` = newest-first, ``"asc"`` = oldest-first).
@@ -96,6 +105,8 @@ class AgentStore(ABC):
         :param before: Cursor agent ID; only return agents appearing
             *before* this agent in the sort order.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
+        :param viewer: Caller whose own templates are included; ``None``
+            lists only unowned templates.
         :returns: A :class:`PagedList` of :class:`Agent` objects.
         """
         ...

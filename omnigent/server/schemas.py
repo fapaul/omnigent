@@ -285,6 +285,9 @@ class AgentObject(BaseModel):
         a user-registered template is superseded by a newer
         same-named upload. Always ``False`` for session-scoped
         agents.
+    :param installed: Whether the caller installed this template with
+        ``omnigent agent add``. The picker lists it over any same-named
+        agent discovered from recent sessions.
     """
 
     id: str
@@ -301,6 +304,7 @@ class AgentObject(BaseModel):
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
     builtin: bool = False
+    installed: bool = False
 
 
 # ── Session Policies ───────────────────────────────────────────

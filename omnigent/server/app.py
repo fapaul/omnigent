@@ -3127,13 +3127,13 @@ def create_app(
         prefix="/v1",
         tags=["usage"],
     )
-    # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
-    # Successor to the removed GET /api/agents list; lists only
-    # built-in (session_id IS NULL) agents for the new-session picker.
+    # Template agent discovery for the new-session picker
+    # (designs/BUILTIN_AGENTS.md), plus user installs (``omnigent agent add``).
     app.include_router(
         create_builtin_agents_router(
             agent_store,
             agent_cache,
+            artifact_store=artifact_store,
             auth_provider=auth_provider,
         ),
         prefix="/v1",
