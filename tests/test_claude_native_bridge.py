@@ -108,6 +108,17 @@ def _composer_pane(draft: str = "") -> str:
 """
 
 
+_BLANK_PROMPT_ROW_MULTILINE_PANE = """\
+startup hook completed
+──────────────────────────────
+❯
+  Reply with exactly this token and nothing else: TEST_TOKEN
+
+──────────────────────────────
+  ⏸ manual mode on
+"""
+
+
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
     settings_path = Path(args[args.index("--settings") + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
@@ -3915,14 +3926,12 @@ def test_inject_user_message_pastes_content_then_submits(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content=content)
 
-    # C-a, C-k (clear), load-buffer, paste-buffer, Enter — fewer than 5
-    # means a delivery step was dropped.
-    assert len(captured) == 5, (
-        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), got {len(captured)}."
+    # An already-empty framed composer needs no control bytes before the
+    # paste; those bytes can arrive as literal invisible paste content.
+    assert len(captured) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(captured)}."
     )
-    clear_home, clear_kill, load, paste, submit = captured
-    assert clear_home[-1] == "C-a"
-    assert clear_kill[-1] == "C-k"
+    load, paste, submit = captured
     # The buffer file carried the normalized content + trailing CR. A
     # missing trailing CR is the trailing-CR regression; a newline that stayed
     # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
@@ -4408,18 +4417,15 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     inject_user_message(bridge_dir, content="hello")
 
     # Gate polled until the third capture (prompt present), then the
-    # five delivery calls (C-a, C-k, load-buffer, paste-buffer, Enter)
-    # fired.
+    # Three delivery calls (load-buffer, paste-buffer, Enter) fire after the
+    # prompt gate; an empty composer needs no clearing controls.
     assert capture_calls["n"] >= 3, (
         f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
     )
-    assert len(send_keys) == 5, (
-        f"Expected 5 tmux calls (C-a, C-k, load-buffer, paste-buffer, Enter), "
-        f"got {len(send_keys)}."
+    assert len(send_keys) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(send_keys)}."
     )
-    clear_home, clear_kill, load, paste, submit = send_keys
-    assert clear_home[-1] == "C-a"
-    assert clear_kill[-1] == "C-k"
+    load, paste, submit = send_keys
     # The paste fires after the gate via the buffer path. The exact
     # payload/flag assertions live in the dedicated paste test; here the
     # gate ordering is the claim.
@@ -4596,6 +4602,276 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
     assert len(enters) == 2, (
         f"Expected the swallowed Enter to be retried exactly once, got {len(enters)} Enter(s)."
     )
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_BLANK_PROMPT_ROW_MULTILINE_PANE, True),
+        (_composer_pane("\n[Pasted text #1 +3 lines]"), True),
+        (_composer_pane("Reply with exactly this token ❯ extra text"), True),
+        ("❯ Reply with exactly this token\n" + _composer_pane(), False),
+        (_composer_pane() + "status: Reply with exactly this token\n", False),
+        (_BLANK_PROMPT_ROW_MULTILINE_PANE.replace("❯", "!"), False),
+        ("❯ Reply with exactly this token\n", False),
+    ],
+    ids=[
+        "continuation-row",
+        "continuation-placeholder",
+        "glyph-inside-draft",
+        "transcript-echo",
+        "footer-text",
+        "shell-composer",
+        "unframed-transcript",
+    ],
+)
+def test_draft_detection_stays_inside_chat_composer(pane: str, expected: bool) -> None:
+    assert (
+        claude_native_bridge._draft_in_input_box(pane, "Reply with exactly this token") is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_composer_pane(), "empty"),
+        ("──────────────────────────────\n\n❯\n──────────────────────────────", "empty"),
+        (_composer_pane("old draft"), "occupied"),
+        (_BLANK_PROMPT_ROW_MULTILINE_PANE, "occupied"),
+        ("──────────────────────────────\n❯ old draft", "occupied"),
+        ("", "unknown"),
+        ("──────────────────────────────", "unknown"),
+        ("──────────────────────────────\n❯", "unknown"),
+    ],
+)
+def test_composer_state_requires_a_structurally_known_chat_frame(
+    pane: str,
+    expected: str,
+) -> None:
+    assert claude_native_bridge._composer_state(pane) == expected
+
+
+def test_inject_user_message_waits_for_empty_composer_after_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear must render empty before the paste can reach the terminal."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    calls: list[list[str]] = []
+    tui = {
+        "pane": _composer_pane("first stale line\nsecond stale line\n"),
+        "clear_sent": False,
+        "empty_barrier_seen": False,
+        "paste_before_empty": False,
+    }
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        calls.append(list(args))
+        if args[0] == "send-keys" and args[-1] == "C-k":
+            tui["clear_sent"] = True
+        elif args[0] == "paste-buffer":
+            if not tui["empty_barrier_seen"]:
+                tui["paste_before_empty"] = True
+            tui["pane"] = _composer_pane("[Pasted text #1 +2 lines]")
+        elif args[0] == "send-keys" and args[-1] == "Enter":
+            tui["pane"] = _composer_pane()
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        if tui["clear_sent"] and not tui["empty_barrier_seen"]:
+            tui["empty_barrier_seen"] = True
+            tui["pane"] = _composer_pane()
+        return tui["pane"]
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    inject_user_message(bridge_dir, content="new message")
+
+    assert tui["empty_barrier_seen"] is True
+    assert tui["paste_before_empty"] is False
+    assert [call[-1] for call in calls if call[0] == "send-keys"] == [
+        "C-a",
+        "C-k",
+        "Enter",
+    ]
+    assert [call[0] for call in calls] == [
+        "send-keys",
+        "send-keys",
+        "load-buffer",
+        "paste-buffer",
+        "send-keys",
+    ]
+
+
+def test_inject_user_message_refuses_to_paste_if_clear_never_renders_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multiline clear failure cannot append the new message to stale input."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    calls: list[list[str]] = []
+    stale_pane = _composer_pane("first stale line\nsecond stale line\n")
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        calls.append(list(args))
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda _socket_path, _tmux_target: stale_pane,
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout, match="empty chat composer"):
+        inject_user_message(bridge_dir, content="new message")
+
+    assert [call[-1] for call in calls] == ["C-a", "C-k"]
+    assert all(call[0] != "load-buffer" for call in calls)
+    assert all(call[0] != "paste-buffer" for call in calls)
+
+
+def test_inject_user_message_does_not_paste_after_unknown_composer_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blank/torn state fails before any clearing or paste command."""
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.0)
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    calls: list[list[str]] = []
+    frames = iter([_composer_pane(), _composer_pane(), _composer_pane(), ""])
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        return next(frames, "")
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        calls.append(list(args))
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout, match="recognized chat composer"):
+        inject_user_message(bridge_dir, content="new message")
+
+    assert calls == []
+
+
+def test_inject_user_message_retries_enter_when_draft_starts_on_continuation_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A visible continuation-row draft still gets submit verification."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    content = "Reply with exactly this token and nothing else: TEST_TOKEN"
+    continuation_pane = _BLANK_PROMPT_ROW_MULTILINE_PANE
+    calls: list[list[str]] = []
+    loaded_payloads: list[bytes] = []
+    tui = {"pane": _composer_pane(), "enters": 0}
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        calls.append(list(args))
+        if args[0] == "load-buffer":
+            loaded_payloads.append(Path(args[-1]).read_bytes())
+        elif args[0] == "paste-buffer":
+            tui["pane"] = continuation_pane
+        elif args[0] == "send-keys" and args[-1] == "Enter":
+            tui["enters"] += 1
+            if tui["enters"] == 2:
+                tui["pane"] = _composer_pane()
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda _socket_path, _tmux_target: tui["pane"],
+    )
+    inject_user_message(bridge_dir, content=content)
+
+    assert loaded_payloads == [content.encode() + b"\r"]
+    assert [call[0] for call in calls] == [
+        "load-buffer",
+        "paste-buffer",
+        "send-keys",
+        "send-keys",
+    ]
+    assert [call[-1] for call in calls if call[0] == "send-keys"] == [
+        "Enter",
+        "Enter",
+    ]
+    assert calls[1] == [
+        "paste-buffer",
+        "-p",
+        "-d",
+        "-b",
+        "omnigent-paste",
+        "-t",
+        "claude:0.0",
+    ]
+
+
+def test_inject_user_message_retries_enter_when_draft_moves_to_continuation_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A swallowed Enter may move the draft below a blank prompt row."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    content = "Reply with exactly this token and nothing else: MOVE_TOKEN"
+    continuation_pane = _BLANK_PROMPT_ROW_MULTILINE_PANE.replace("TEST_TOKEN", "MOVE_TOKEN")
+    calls: list[list[str]] = []
+    loaded_payloads: list[bytes] = []
+    tui = {"pane": _composer_pane(), "enters": 0}
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        del socket_path
+        calls.append(list(args))
+        if args[0] == "load-buffer":
+            loaded_payloads.append(Path(args[-1]).read_bytes())
+        elif args[0] == "paste-buffer":
+            tui["pane"] = _composer_pane(content)
+        elif args[0] == "send-keys" and args[-1] == "Enter":
+            tui["enters"] += 1
+            if tui["enters"] == 1:
+                tui["pane"] = continuation_pane
+            else:
+                tui["pane"] = _composer_pane()
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda _socket_path, _tmux_target: tui["pane"],
+    )
+    inject_user_message(bridge_dir, content=content)
+
+    assert loaded_payloads == [content.encode() + b"\r"]
+    assert tui["enters"] == 2
+    assert [call[-1] for call in calls if call[0] == "send-keys"] == [
+        "Enter",
+        "Enter",
+    ]
 
 
 def test_inject_user_message_raises_when_draft_never_submits(
@@ -10260,10 +10536,12 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     inject_user_message(bridge_dir, content="restore my composer")
 
     tails = [cmd[-1] for cmd in captured]
-    # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "C-a", "C-k"], (
-        f"Expected the occupying surface to be Escaped before the clear; got {tails}."
+    # Escape (dismiss the surface) must precede delivery, and the restored
+    # composer is empty so no clear controls are emitted.
+    assert tails[0] == "Escape", (
+        f"Expected the occupying surface to be Escaped before delivery; got {tails}."
     )
+    assert "C-a" not in tails and "C-k" not in tails, tails
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
     assert tails[-1] == "Enter"
 

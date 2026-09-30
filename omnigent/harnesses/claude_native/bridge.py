@@ -54,7 +54,7 @@ from http import HTTPStatus
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
 from urllib import request
 
 from filelock import FileLock
@@ -253,6 +253,10 @@ _SHELL_MODE_GLYPH = "!"
 # has. A row starting with one of these is a candidate input box; which
 # glyph it is says whether a chat message may be typed there.
 _COMPOSER_MODE_GLYPHS = (_CLAUDE_PROMPT_GLYPH, _SHELL_MODE_GLYPH)
+_ComposerState = Literal["empty", "occupied", "unknown"]
+_COMPOSER_EMPTY: _ComposerState = "empty"
+_COMPOSER_OCCUPIED: _ComposerState = "occupied"
+_COMPOSER_UNKNOWN: _ComposerState = "unknown"
 # Box-drawing glyphs a TUI horizontal rule is made of. A rule directly
 # above a composer glyph is what marks the live input box rather than a
 # prompt echoed into scrollback (see :func:`_composer_row`), and the last
@@ -3988,10 +3992,11 @@ def _paste_and_submit(
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
 
     The delivery core of :func:`inject_user_message` (see its docstring for
-    the full hazard notes): clear any leftover draft, bracketed-paste the
-    payload via ``load-buffer`` + ``paste-buffer -p``, wait for the draft to
-    visibly commit, submit, and verify the draft left the box — re-sending
-    Enter while it verifiably hasn't.
+    the full hazard notes): inspect the framed composer, clear an occupied
+    draft and wait for its rendered empty state, bracketed-paste the payload
+    via ``load-buffer`` + ``paste-buffer -p``, wait for the draft to visibly
+    commit, submit, and verify the draft left the box — re-sending Enter while
+    it verifiably hasn't. Blank or torn captures never authorize a paste.
 
     :param bridge_dir: Bridge directory path (hosts the paste temp file).
     :param socket_path: Absolute path to the tmux socket.
@@ -4007,15 +4012,27 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
-    # Clear any leftover text in Claude's input field before typing.
-    # After Escape-cancel, Claude Code re-populates the prompt area
-    # with the previous input for re-editing. Without this clear,
-    # the new message appends to the stale buffer (e.g.
-    # "old promptnew prompt" with no separator).
-    # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
-    # Ctrl-U only clears backwards from cursor.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    # Clear a recognized occupied composer and wait for its rendered empty
+    # state before loading the paste buffer. This keeps C-a/C-k out of the
+    # paste burst, where Claude can receive them as literal invisible bytes.
+    composer_state = _wait_for_composer_state(
+        socket_path,
+        tmux_target,
+        bridge_dir=bridge_dir,
+    )
+    if composer_state == _COMPOSER_OCCUPIED:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+        _wait_for_composer_state(
+            socket_path,
+            tmux_target,
+            expected=_COMPOSER_EMPTY,
+            bridge_dir=bridge_dir,
+        )
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; message not sent."
+        )
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -5429,19 +5446,88 @@ def _composer_row(pane: str) -> str | None:
     :returns: The row's text, e.g. ``"❯ fix the bug"`` or ``"!"`` in shell
         mode, or ``None`` when no input box is on screen.
     """
-    non_empty = [line for line in pane.splitlines() if line.strip()]
-    rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
+    composer = _composer_region(pane)
+    return composer[0] if composer is not None else None
+
+
+def _composer_region(pane: str) -> tuple[str, list[str], bool] | None:
+    """Return the live row, frame contents, and whether its closing rule is visible."""
+    lines = pane.splitlines()
+    non_empty = [(idx, line) for idx, line in enumerate(lines) if line.strip()]
+    rules = [idx for idx, (_, line) in enumerate(non_empty) if _is_box_rule(line)]
     if not rules:
         return None
-    candidates = [rules[-2] + 1] if len(rules) >= 2 else []
-    candidates.append(rules[-1] + 1)
-    for idx in candidates:
-        if idx >= len(non_empty):
+    candidates = [rules[-2]] if len(rules) >= 2 else []
+    candidates.append(rules[-1])
+    for opening_idx in candidates:
+        row_idx = opening_idx + 1
+        if row_idx >= len(non_empty):
             continue
-        row = non_empty[idx]
-        if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
-            return row
+        row = non_empty[row_idx][1]
+        if row.strip()[:1] not in _COMPOSER_MODE_GLYPHS:
+            continue
+        closing_idx = next((idx for idx in rules if idx > opening_idx), None)
+        start = non_empty[opening_idx][0] + 1
+        end = non_empty[closing_idx][0] if closing_idx is not None else len(lines)
+        return row, lines[start:end], closing_idx is not None
     return None
+
+
+def _composer_state(pane: str) -> _ComposerState:
+    """Classify a captured chat composer without treating a torn frame as empty."""
+    composer = _composer_region(pane)
+    if composer is None or _history_search_footer_shown(pane):
+        return _COMPOSER_UNKNOWN
+    row, region, frame_closed = composer
+    prompt = row.strip()
+    if not prompt.startswith(_CLAUDE_PROMPT_GLYPH):
+        return _COMPOSER_UNKNOWN
+    try:
+        row_index = region.index(row)
+    except ValueError:
+        return _COMPOSER_UNKNOWN
+    continuation = region[:row_index] + region[row_index + 1 :]
+    occupied = prompt[len(_CLAUDE_PROMPT_GLYPH) :].strip() or any(
+        line.strip() for line in continuation
+    )
+    if occupied:
+        return _COMPOSER_OCCUPIED
+    if not frame_closed:
+        return _COMPOSER_UNKNOWN
+    return _COMPOSER_EMPTY
+
+
+def _wait_for_composer_state(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    expected: _ComposerState | None = None,
+    bridge_dir: Path | None = None,
+    timeout_s: float = _PASTE_COMMIT_TIMEOUT_S,
+) -> _ComposerState:
+    """Wait for a recognized composer state before writing to the pane."""
+    deadline = time.monotonic() + timeout_s
+    last_nonempty = ""
+    while True:
+        _check_injection_cancelled()
+        pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_user_prompt_pending(bridge_dir, pane)
+        state = _composer_state(pane)
+        if state != _COMPOSER_UNKNOWN and (expected is None or state == expected):
+            return state
+        if pane.strip():
+            last_nonempty = pane
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+    target = (
+        "an empty chat composer" if expected == _COMPOSER_EMPTY else "a recognized chat composer"
+    )
+    raise ClaudePromptTimeout(
+        f"Claude Code did not render {target} within {timeout_s:.1f}s; "
+        "the message was not delivered." + _format_terminal_failure_tail(last_nonempty)
+    )
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
@@ -5584,14 +5670,12 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     """
     Return whether the pasted draft is visible in Claude's input box.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
-    :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
-    collapses large pastes).
+    Looks only inside the framed composer selected by
+    :func:`_composer_row`, so continuation lines and blank prompt rows
+    are included without matching transcript or footer text. The draft
+    counts as visible when the region contains *needle* (small pastes
+    render verbatim) or the :data:`_PASTED_PLACEHOLDER_PREFIX`
+    placeholder (Claude Code collapses large pastes).
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :param needle: Marker from :func:`_submit_needle`, e.g.
@@ -5599,13 +5683,14 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
         only the paste placeholder is then considered.
     :returns: ``True`` when the draft is still sitting in the input box.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
+    composer = _composer_region(pane)
+    if composer is None:
         return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
-        return True
-    return bool(needle) and needle in tail
+    row, region, _frame_closed = composer
+    if not row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
+        return False
+    text = "\n".join(region)
+    return _PASTED_PLACEHOLDER_PREFIX in text or (bool(needle) and needle in text)
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
