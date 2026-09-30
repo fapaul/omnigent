@@ -315,6 +315,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
+import { installAgentBundle } from "@/lib/agentsApi";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
 
@@ -7013,6 +7014,17 @@ export function NewChatLandingScreen() {
         onCreate={(input) => {
           setPendingAgent(input);
           handleSelectPending();
+        }}
+        onImport={async (bundle) => {
+          const installed = await installAgentBundle(bundle);
+          // Refetch the picker so the install shows beside the built-ins, then pick it.
+          await queryClient.invalidateQueries({ queryKey: ["available-agents-catalog"] });
+          await queryClient.invalidateQueries({ queryKey: ["available-agents"] });
+          const agent = queryClient
+            .getQueriesData<AvailableAgent[]>({ queryKey: ["available-agents"] })
+            .flatMap(([, rows]) => rows ?? [])
+            .find((a) => a.id === installed.id);
+          if (agent) handleSelectAgent(agent);
         }}
       />
     </div>
