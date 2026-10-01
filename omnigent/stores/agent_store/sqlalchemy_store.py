@@ -213,12 +213,16 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         with self._session("select_agent_by_name") as session:
             row = session.execute(
-                select(SqlAgent).where(
+                select(SqlAgent)
+                .where(
                     SqlAgent.workspace_id == current_workspace_id(),
                     SqlAgent.kind == encode_agent_kind("template"),
                     _owned_by(created_by),
                     SqlAgent.name == name,
                 )
+                # Oldest wins if a racing insert ever left a duplicate.
+                .order_by(SqlAgent.created_at, SqlAgent.id)
+                .limit(1)
             ).scalar_one_or_none()
             return sql_agent_to_entity(row) if row else None
 

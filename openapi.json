@@ -4783,6 +4783,11 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "agent_install": {
+            "default": true,
+            "title": "Agent Install",
+            "type": "boolean"
+          },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },

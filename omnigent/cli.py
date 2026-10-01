@@ -11467,7 +11467,7 @@ def _raise_for_agent_api(resp: Any) -> None:  # type: ignore[explicit-any]  # ht
     try:
         body = resp.json()
         detail = body.get("error", {}).get("message") or body.get("detail") or resp.text
-    except ValueError:
+    except (ValueError, AttributeError):  # non-JSON, or JSON of an unexpected shape
         detail = resp.text
     raise click.ClickException(f"{resp.status_code}: {detail}")
 
@@ -11519,9 +11519,10 @@ def _list_agents(client: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-
         _raise_for_agent_api(resp)
         page = resp.json()
         rows.extend(page["data"])
-        if not page.get("has_more"):
+        next_after = page.get("last_id")
+        if not page.get("has_more") or not next_after or next_after == after:
             return rows
-        after = page.get("last_id")
+        after = next_after
 
 
 @agent_grp.command("list")

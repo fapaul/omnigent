@@ -26,6 +26,7 @@ import hashlib
 import logging
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import UploadFile
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id
@@ -40,6 +41,9 @@ from omnigent.stores import AgentStore
 from omnigent.stores.artifact_store import ArtifactStore
 
 _logger = logging.getLogger(__name__)
+
+# Upper bound on an uploaded install bundle, checked before it is read into memory.
+MAX_INSTALL_BUNDLE_BYTES = 100 * 1024 * 1024
 
 
 def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
@@ -135,7 +139,6 @@ def install_user_agent(
     *,
     owner: str | None,
     name: str,
-    description: str | None,
     bundle_bytes: bytes,
 ) -> Agent:
     """
@@ -151,7 +154,6 @@ def install_user_agent(
 
     :param owner: Installing user, or ``None`` on an auth-less server.
     :param name: Agent name from the bundle's spec, e.g. ``"orion"``.
-    :param description: Description from the spec, if any.
     :param bundle_bytes: Gzipped tarball already checked by
         :func:`validate_agent_bundle`.
     :returns: The created or updated template agent.
@@ -169,7 +171,15 @@ def install_user_agent(
         agent_id = generate_agent_id()
         location = f"{agent_id}/{bundle_hash}"
         artifact_store.put(location, bundle_bytes)
-        return agent_store.create(agent_id, name, location, description, created_by=owner)
+        try:
+            # No stored description: the listing reads it from the current
+            # bundle's spec, so a reinstall never shows a stale one.
+            return agent_store.create(agent_id, name, location, created_by=owner)
+        except IntegrityError:
+            # A concurrent install of the same name won; replace that row instead.
+            existing = agent_store.get_by_name(name, created_by=owner)
+            if existing is None:
+                raise
     location = f"{existing.id}/{bundle_hash}"
     artifact_store.put(location, bundle_bytes)
     if existing.bundle_location == location:
@@ -252,6 +262,11 @@ def create_builtin_agents_router(
         bundle = (await request.form()).get("bundle")
         if not isinstance(bundle, UploadFile):
             raise HTTPException(status_code=422, detail="multipart part 'bundle' is required")
+        if bundle.size is not None and bundle.size > MAX_INSTALL_BUNDLE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"agent bundle exceeds {MAX_INSTALL_BUNDLE_BYTES // (1024 * 1024)} MiB",
+            )
         bundle_bytes = await bundle.read()
         spec = await asyncio.to_thread(
             validate_agent_bundle,
@@ -267,10 +282,10 @@ def create_builtin_agents_router(
             agent_cache,
             owner=user_id,
             name=spec.name,
-            description=spec.description,
             bundle_bytes=bundle_bytes,
         )
-        return _to_agent_object(agent, agent_cache)
+        # Loads (extracts) the just-written bundle; keep it off the event loop.
+        return await asyncio.to_thread(_to_agent_object, agent, agent_cache)
 
     @router.delete("/agents/{agent_id}")
     async def remove_agent(request: Request, agent_id: str) -> dict[str, object]:
@@ -290,6 +305,7 @@ def create_builtin_agents_router(
             raise OmnigentError(f"Agent not found: {agent_id!r}", code=ErrorCode.NOT_FOUND)
         if agent.id == builtin_agent_id(agent.name):
             raise OmnigentError("Built-in agents cannot be removed.", code=ErrorCode.INVALID_INPUT)
+        # Blobs stay: sessions started from this agent share its bundle_location.
         await asyncio.to_thread(agent_store.delete, agent_id)
         agent_cache.evict(agent_id)
         return {"id": agent_id, "deleted": True}

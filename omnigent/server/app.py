@@ -183,6 +183,8 @@ class ServerInfoResponse(BaseModel):
     harness_install_enabled: bool
     installable_harnesses: list[str]
     dictation_available: bool
+    # POST /v1/agents installs (`omnigent agent add`); absent on older servers.
+    agent_install: bool = True
     branding: BrandingInfo
 
 

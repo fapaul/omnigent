@@ -111,6 +111,9 @@ async def test_reinstall_replaces_in_place(client) -> None:
     second = (await _install(client, ALICE, "orion", "v2")).json()
     assert second["id"] == first["id"], "reinstall must keep the agent id stable"
     assert second["version"] == first["version"] + 1
+    assert second["description"] == "v2", "reinstall must show the new bundle's description"
+    listed = (await _names(client, ALICE))["orion"]
+    assert [r["description"] for r in listed] == ["v2"]
     assert len((await _names(client, ALICE))["orion"]) == 1
 
 
@@ -149,8 +152,10 @@ async def test_remove_is_owner_only(client, agent_store) -> None:
     operator_id = generate_agent_id()
     agent_store.create(operator_id, "shared", "test:///shared")
 
-    assert (await client.delete(f"/v1/agents/{mine['id']}", headers=BOB)).status_code == 404
-    assert (await client.delete(f"/v1/agents/{operator_id}", headers=ALICE)).status_code == 404
+    bob_resp = await client.delete(f"/v1/agents/{mine['id']}", headers=BOB)
+    assert bob_resp.status_code == 404
+    operator_resp = await client.delete(f"/v1/agents/{operator_id}", headers=ALICE)
+    assert operator_resp.status_code == 404
     assert agent_store.get(operator_id) is not None
 
     resp = await client.delete(f"/v1/agents/{mine['id']}", headers=ALICE)
@@ -165,6 +170,31 @@ async def test_builtin_names_are_reserved(client, agent_store) -> None:
     assert resp.status_code == 409, resp.text
     assert "polly" in resp.json()["error"]
     assert [r["id"] for r in (await _names(client, ALICE))["polly"]] == [builtin_agent_id("polly")]
+
+
+async def test_oversized_bundle_is_413(client, monkeypatch) -> None:
+    monkeypatch.setattr("omnigent.server.routes.builtin_agents.MAX_INSTALL_BUNDLE_BYTES", 10)
+    resp = await _install(client, ALICE, "orion")
+    assert resp.status_code == 413, resp.text
+
+
+async def test_concurrent_install_of_same_name_replaces_instead_of_failing(
+    client, agent_store, monkeypatch
+) -> None:
+    """The losing side of a get-then-create race updates the winner's row."""
+    winner = (await _install(client, ALICE, "orion", "first")).json()
+    real_get_by_name = agent_store.get_by_name
+    calls = []
+
+    def stale_then_real(name, created_by=None):
+        calls.append(name)
+        return None if len(calls) == 1 else real_get_by_name(name, created_by=created_by)
+
+    monkeypatch.setattr(agent_store, "get_by_name", stale_then_real)
+    resp = await _install(client, ALICE, "orion", "second")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == winner["id"]
+    assert resp.json()["description"] == "second"
 
 
 async def test_install_without_bundle_is_422(client) -> None:
