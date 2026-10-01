@@ -2335,6 +2335,195 @@ args = []
     }
 
 
+async def test_cold_start_refreshes_user_mcp_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new app-server reads current MCPs without resetting session settings."""
+    source = tmp_path / "source"
+    source.mkdir()
+    source_config = source / "config.toml"
+    source_config.write_text(
+        'model = "shared"\n[mcp_servers.changed]\ncommand = "old"\n'
+        'env = { OLD = "value" }\n[mcp_servers.removed]\ncommand = "removed"\n'
+    )
+    private = tmp_path / "private"
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, private, tmp_path / "bridge", tmp_path)
+    await server.start()
+    await server.close()
+    assert server.proc is None
+    config_path = private / "config.toml"
+    document = tomlkit.parse(config_path.read_text())
+    document["model"] = "session-model"
+    document["model_reasoning_effort"] = "high"
+    config_path.write_text(tomlkit.dumps(document))
+    updated = (
+        'model = "new-shared-model"\n[mcp_servers.changed]\ncommand = "new"\n'
+        'env = { NEW = "value" }\n[mcp_servers.added]\nurl = "https://example.test/mcp"\n'
+        "enabled = false\n"
+    )
+    source_config.write_text(updated)
+
+    await server.start()
+    await server.close()
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "session-model"
+    assert config["model_reasoning_effort"] == "high"
+    assert set(config["mcp_servers"]) == {"changed", "added", "omnigent"}
+    assert config["mcp_servers"]["changed"] == {"command": "new", "env": {"NEW": "value"}}
+    assert config["mcp_servers"]["added"]["enabled"] is False
+    assert config["mcp_servers"]["omnigent"]["command"] == "/new/python"
+    assert source_config.read_text() == updated
+
+
+@pytest.mark.parametrize("empty_source", [None, "", "[mcp_servers]\n"])
+async def test_cold_start_removes_all_user_mcps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_source: str | None
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    source_config = source / "config.toml"
+    source_config.write_text('[mcp_servers.removed]\ncommand = "old"\n')
+    private = tmp_path / "private"
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, private, tmp_path / "bridge", tmp_path)
+    await server.start()
+    await server.close()
+    if empty_source is None:
+        source_config.unlink()
+    else:
+        source_config.write_text(empty_source)
+
+    await server.start()
+    await server.close()
+
+    config = tomllib.loads((private / "config.toml").read_text())
+    assert set(config["mcp_servers"]) == {"omnigent"}
+
+
+@pytest.mark.parametrize("version", [(0, 133, 0), (0, 154, 0)])
+async def test_cold_start_refreshes_mcps_across_profile_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: tuple[int, int, int]
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    private = tmp_path / "private"
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=version))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, private, tmp_path / "bridge", tmp_path)
+    for generation, profile in enumerate(("work", "work", "other", None)):
+        base = {"mcp_servers": {"shared": {"command": "base", "args": [str(generation)]}}}
+        overlays = {
+            "work": {"mcp_servers": {"shared": {"command": f"work-{generation}"}}},
+            "other": {"mcp_servers": {"other": {"command": "other"}}},
+        }
+        (source / "config.toml").write_text(tomlkit.dumps({**base, "profiles": overlays}))
+        for name, overlay in overlays.items():
+            (source / f"{name}.config.toml").write_text(tomlkit.dumps(overlay))
+        server.config_profile = profile
+
+        await server.start()
+        await server.close()
+
+        config = tomllib.loads((private / "config.toml").read_text())
+        servers = config["mcp_servers"]
+        assert servers["shared"] == {
+            "command": f"work-{generation}" if profile == "work" else "base",
+            "args": [str(generation)],
+        }
+        assert set(servers) == (
+            {"shared", "omnigent", "other"} if profile == "other" else {"shared", "omnigent"}
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid", ["invalid = [", 'mcp_servers = "bad"', "[mcp_servers]\nbad = 1"]
+)
+@pytest.mark.parametrize("profile", [None, "work"])
+async def test_cold_start_invalid_mcp_source_preserves_private_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str, profile: str | None
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(invalid if profile is None else "")
+    if profile:
+        (source / f"{profile}.config.toml").write_text(invalid)
+    private = tmp_path / "private"
+    private.mkdir()
+    original = 'model = "private"\n[mcp_servers.existing]\ncommand = "keep"\n'
+    (private / "config.toml").write_text(original)
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    monkeypatch.setattr(app_server, "_codex_cli_version", AsyncMock(return_value=(0, 154, 0)))
+    spawn = AsyncMock()
+    monkeypatch.setattr(app_server.asyncio, "create_subprocess_exec", spawn)
+    server = _test_app_server(tmp_path, private, tmp_path / "bridge", tmp_path)
+    server.config_profile = profile
+
+    with pytest.raises(ValueError, match=r"Codex.*config"):
+        await server.start()
+
+    assert (private / "config.toml").read_text() == original
+    spawn.assert_not_called()
+
+
+async def test_cold_start_minimal_config_does_not_import_ambient_mcps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text('[mcp_servers.ambient]\ncommand = "do-not-start"\n')
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    monkeypatch.setenv("HARNESS_CODEX_MINIMAL_CONFIG", "true")
+    _disable_codex_startup_rpc(monkeypatch)
+    private = tmp_path / "private"
+    server = _test_app_server(tmp_path, private, tmp_path / "bridge", tmp_path)
+
+    await server.start()
+    await server.close()
+
+    assert set(tomllib.loads((private / "config.toml").read_text())["mcp_servers"]) == {"omnigent"}
+
+
+def test_mcp_refresh_atomically_replaces_private_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "source.toml"
+    original = 'model = "keep"\n[mcp_servers.old]\ncommand = "old"\n'
+    source.write_text(original)
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    config_path.symlink_to(source)
+
+    app_server._inject_mcp_server_config(
+        private, tmp_path / "bridge", mcp_servers={"new": {"command": "new"}}
+    )
+
+    assert source.read_text() == original
+    assert not config_path.is_symlink()
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "keep"
+    assert set(config["mcp_servers"]) == {"new", "omnigent"}
+
+
+def test_failed_mcp_refresh_preserves_private_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    original = 'model = "keep"\n[mcp_servers.old]\ncommand = "old"\n'
+    config_path.write_text(original)
+    monkeypatch.setattr(launch_args.os, "replace", Mock(side_effect=OSError("write failed")))
+
+    with pytest.raises(OSError, match="write failed"):
+        app_server._inject_mcp_server_config(tmp_path, tmp_path / "bridge", mcp_servers={})
+
+    assert config_path.read_text() == original
+    assert not list(tmp_path.glob(".config.toml.*"))
+
+
 async def test_start_can_delegate_global_process_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

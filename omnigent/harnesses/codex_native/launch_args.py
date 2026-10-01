@@ -226,6 +226,51 @@ def _write_private_config(path: Path, content: str) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def read_codex_mcp_servers(
+    source_home: Path,
+    profile: str | None,
+    *,
+    codex_version: tuple[int, int, int] | None,
+    minimal_config: bool = False,
+) -> dict[str, Any]:
+    """Read current user MCPs, with the selected profile layered over the base."""
+
+    def read(path: Path, *, optional: bool = False) -> dict[str, Any]:
+        try:
+            return tomlkit.parse(path.read_text()).unwrap()
+        except FileNotFoundError:
+            if optional:
+                return {}
+            raise ValueError(f"Missing Codex MCP config: {path}") from None
+        except (OSError, TOMLKitError):
+            raise ValueError(f"Cannot read Codex MCP config: {path}") from None
+
+    def inventory(config: dict[str, Any], path: Path) -> dict[str, Any]:
+        servers = config.get("mcp_servers", {})
+        if not isinstance(servers, dict) or any(
+            not isinstance(server, dict) for server in servers.values()
+        ):
+            raise ValueError(f"Invalid mcp_servers table in Codex config: {path}")
+        return copy.deepcopy(servers)
+
+    source_path = source_home / "config.toml"
+    source = read(source_path, optional=True)
+    servers = {} if minimal_config else inventory(source, source_path)
+    if profile is not None:
+        codex_config_profile(["--profile", profile])
+        if codex_version is None or codex_version >= (0, 134, 0):
+            profile_path = source_home / f"{profile}.config.toml"
+            overlay = read(profile_path)
+        else:
+            profile_path = source_path
+            profiles = source.get("profiles", {})
+            overlay = profiles.get(profile) if isinstance(profiles, dict) else None
+            if not isinstance(overlay, dict):
+                raise ValueError(f"Codex config profile {profile!r} does not exist")
+        _merge_tables(servers, inventory(overlay, profile_path))
+    return servers
+
+
 def _profile_base(state_path: Path, current: dict[str, Any]) -> dict[str, Any]:
     try:
         state = tomlkit.parse(state_path.read_text()).unwrap()
