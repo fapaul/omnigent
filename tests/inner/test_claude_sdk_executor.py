@@ -5953,6 +5953,9 @@ async def test_terminated_cli_client_is_evicted_and_turn_recovers() -> None:
     prompt = fresh.prompts[0]
     assert isinstance(prompt, str)
     assert "first question" in prompt
+    # The intervening assistant turn must be replayed too: the rebuilt client
+    # has no session memory, so a user-only replay would drop its own answers.
+    assert "first answer" in prompt
     assert "second question" in prompt
 
     assert "sess-1" not in executor._crashed_sessions
