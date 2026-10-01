@@ -189,6 +189,12 @@ screenshots, or a Playwright script outside that suite, read pixels via
 `page.evaluate` (e.g. a canvas
 `toDataURL()`) or capture from a second, unrecorded context instead.
 
+**Maintenance:** Context closure before fixture teardown and screenshot crop
+rounding rely on pytest-playwright and Chromium internals; after Playwright,
+pytest-playwright, or Chromium upgrades, rerun
+`tests/e2e_ui/test_recorded_page_clip_screenshots.py` and
+`tests/e2e_ui/test_recording_stops_before_teardown.py` as canaries.
+
 ## `mobile` facets
 
 The iOS/Android apps are thin native shells that load the *same* server-served SPA
