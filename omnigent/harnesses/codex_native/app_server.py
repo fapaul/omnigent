@@ -61,7 +61,6 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
-    _CODEX_MINIMAL_CONFIG_ENV,
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
     _codex_cli_version,
@@ -73,6 +72,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
     codex_extended_catalog_requested,
+    codex_minimal_config_requested,
     codex_router_bridge_dir,
     codex_router_hooks_settings,
     codex_router_session_id,
@@ -192,57 +192,6 @@ def _format_codex_version(version: tuple[int, int, int] | None) -> str:
     if version is None:
         return "unknown"
     return ".".join(str(part) for part in version)
-
-
-def _toml_table_header_name(line: str) -> str | None:
-    """
-    Return the TOML table name declared by *line*, if any.
-
-    This intentionally recognizes only normal table headers because the
-    injected Codex MCP server config is a normal table. Array tables are
-    left untouched.
-
-    :param line: One config line, e.g.
-        ``"[mcp_servers.omnigent] # generated\n"``.
-    :returns: The table name, e.g. ``"mcp_servers.omnigent"``, or
-        ``None`` when *line* is not a normal table header.
-    """
-    stripped = line.strip()
-    if not stripped.startswith("["):
-        return None
-    if stripped.startswith("[["):
-        return None
-    end = stripped.find("]")
-    if end < 0:
-        return None
-    suffix = stripped[end + 1 :].strip()
-    if suffix and not suffix.startswith("#"):
-        return None
-    return stripped[1:end].strip()
-
-
-def _remove_toml_table(text: str, table_name: str) -> str:
-    """
-    Remove one TOML table and its subtables from a config document.
-
-    Used for generated private Codex config before appending the
-    Omnigent MCP server table. This avoids accumulating duplicate
-    ``[mcp_servers.omnigent]`` sections across terminal relaunches.
-
-    :param text: TOML document text.
-    :param table_name: Table name to remove, e.g.
-        ``"mcp_servers.omnigent"``.
-    :returns: TOML text with the target table block removed.
-    """
-    kept: list[str] = []
-    skipping = False
-    for line in text.splitlines(keepends=True):
-        header = _toml_table_header_name(line)
-        if header is not None:
-            skipping = header == table_name or header.startswith(f"{table_name}.")
-        if not skipping:
-            kept.append(line)
-    return "".join(kept).rstrip()
 
 
 #: Omnigent tools the framework calls on every session's behalf, pre-approved
@@ -833,7 +782,9 @@ def _inject_mcp_server_config(
     """
     config_path = codex_home / "config.toml"
     document = (
-        tomlkit.parse(config_path.read_text()) if config_path.exists() else tomlkit.document()
+        tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        if config_path.exists()
+        else tomlkit.document()
     )
     # Replace, rather than merge, so deleted servers and fields do not survive.
     servers = {name: config for name, config in mcp_servers.items() if name != "omnigent"}
@@ -1882,6 +1833,12 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
+        config_source = _codex_home_config_source_from_env()
+        if self.codex_home.resolve() == config_source.resolve():
+            raise ValueError(
+                "Omnigent could not isolate this session's Codex configuration. "
+                "Startup was stopped to protect your shared config. Please report this as a bug."
+            )
         self.codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.codex_home, 0o700)
         if self.listen_url is None or self.listen_url.startswith("unix://"):
@@ -1919,14 +1876,7 @@ class CodexNativeAppServer:
                 router_bridge_dir = None
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
-        config_source = _codex_home_config_source_from_env()
-        if self.codex_home.resolve() == config_source.resolve():
-            raise ValueError("Codex native startup requires a private CODEX_HOME")
-        minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
+        minimal_config = codex_minimal_config_requested()
         mcp_servers = read_codex_mcp_servers(
             config_source,
             self.config_profile,

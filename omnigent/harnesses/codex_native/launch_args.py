@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import tomlkit
-from tomlkit.exceptions import TOMLKitError
+from tomlkit.exceptions import ParseError, TOMLKitError
 
 _CODEX_CONFIG_PATHS = (
     "agents.*.config_file",
@@ -237,13 +237,24 @@ def read_codex_mcp_servers(
 
     def read(path: Path, *, optional: bool = False) -> dict[str, Any]:
         try:
-            return tomlkit.parse(path.read_text()).unwrap()
+            return tomlkit.parse(path.read_text(encoding="utf-8")).unwrap()
         except FileNotFoundError:
             if optional:
                 return {}
             raise ValueError(f"Missing Codex MCP config: {path}") from None
-        except (OSError, TOMLKitError):
-            raise ValueError(f"Cannot read Codex MCP config: {path}") from None
+        except OSError as error:
+            reason = error.strerror or type(error).__name__
+            raise ValueError(f"Cannot read Codex MCP config: {path} ({reason})") from None
+        except ParseError as error:
+            # Parser messages can contain config values; expose the location and kind only.
+            raise ValueError(
+                f"Invalid Codex MCP config: {path} "
+                f"({type(error).__name__} at line {error.line}, column {error.col})"
+            ) from None
+        except (TOMLKitError, UnicodeError) as error:
+            raise ValueError(
+                f"Invalid Codex MCP config: {path} ({type(error).__name__})"
+            ) from None
 
     def inventory(config: dict[str, Any], path: Path) -> dict[str, Any]:
         servers = config.get("mcp_servers", {})
@@ -257,6 +268,7 @@ def read_codex_mcp_servers(
     source = read(source_path, optional=True)
     servers = {} if minimal_config else inventory(source, source_path)
     if profile is not None:
+        # Reject invalid profile names before deriving a file path from them.
         codex_config_profile(["--profile", profile])
         if codex_version is None or codex_version >= (0, 134, 0):
             profile_path = source_home / f"{profile}.config.toml"

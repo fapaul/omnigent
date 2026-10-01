@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import stat
@@ -2373,7 +2374,10 @@ async def test_cold_start_refreshes_user_mcp_inventory(
     assert config["model_reasoning_effort"] == "high"
     assert set(config["mcp_servers"]) == {"changed", "added", "omnigent"}
     assert config["mcp_servers"]["changed"] == {"command": "new", "env": {"NEW": "value"}}
-    assert config["mcp_servers"]["added"]["enabled"] is False
+    assert config["mcp_servers"]["added"] == {
+        "url": "https://example.test/mcp",
+        "enabled": False,
+    }
     assert config["mcp_servers"]["omnigent"]["command"] == "/new/python"
     assert source_config.read_text() == updated
 
@@ -2441,17 +2445,37 @@ async def test_cold_start_refreshes_mcps_across_profile_changes(
 
 
 @pytest.mark.parametrize(
-    "invalid", ["invalid = [", 'mcp_servers = "bad"', "[mcp_servers]\nbad = 1"]
+    "invalid",
+    [
+        "invalid = [",
+        'mcp_servers = "bad"',
+        "[mcp_servers]\nbad = 1",
+        PermissionError(errno.EACCES, "Permission denied"),
+    ],
 )
 @pytest.mark.parametrize("profile", [None, "work"])
 async def test_cold_start_invalid_mcp_source_preserves_private_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str, profile: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid: str | OSError,
+    profile: str | None,
 ) -> None:
     source = tmp_path / "source"
     source.mkdir()
-    (source / "config.toml").write_text(invalid if profile is None else "")
+    content = invalid if isinstance(invalid, str) else ""
+    (source / "config.toml").write_text(content if profile is None else "")
     if profile:
-        (source / f"{profile}.config.toml").write_text(invalid)
+        (source / f"{profile}.config.toml").write_text(content)
+    failed_path = source / (f"{profile}.config.toml" if profile else "config.toml")
+    if isinstance(invalid, OSError):
+        original_read = Path.read_text
+
+        def read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+            if path == failed_path:
+                raise invalid
+            return original_read(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
     private = tmp_path / "private"
     private.mkdir()
     original = 'model = "private"\n[mcp_servers.existing]\ncommand = "keep"\n'
@@ -2463,10 +2487,83 @@ async def test_cold_start_invalid_mcp_source_preserves_private_config(
     server = _test_app_server(tmp_path, private, tmp_path / "bridge", tmp_path)
     server.config_profile = profile
 
-    with pytest.raises(ValueError, match=r"Codex.*config"):
+    with pytest.raises(ValueError, match=r"Codex.*config") as caught:
         await server.start()
 
+    assert str(failed_path) in str(caught.value)
+    if isinstance(invalid, OSError):
+        assert "Permission denied" in str(caught.value)
+    elif invalid == "invalid = [":
+        assert "UnexpectedEofError at line 1, column" in str(caught.value)
     assert (private / "config.toml").read_text() == original
+    spawn.assert_not_called()
+
+
+@pytest.mark.parametrize("profile", [None, "work"])
+def test_mcp_refresh_reads_utf8_independently_of_locale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str | None
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    config_path.write_text('developer_instructions = "保持设置"\n', encoding="utf-8")
+    (source / "config.toml").write_text(
+        '[mcp_servers.search]\ncommand = "搜索"\n', encoding="utf-8"
+    )
+    if profile:
+        (source / f"{profile}.config.toml").write_text(
+            '[mcp_servers.search]\nargs = ["資料"]\n', encoding="utf-8"
+        )
+    original_read = Path.read_text
+
+    def read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        assert kwargs.get("encoding") == "utf-8"
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    servers = launch_args.read_codex_mcp_servers(source, profile, codex_version=(0, 154, 0))
+    app_server._inject_mcp_server_config(private, tmp_path / "bridge", mcp_servers=servers)
+
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    expected = {"command": "搜索", **({"args": ["資料"]} if profile else {})}
+    assert config["mcp_servers"]["search"] == expected
+    assert config["developer_instructions"] == "保持设置"
+
+
+def test_mcp_parse_diagnostic_does_not_expose_config_values(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[mcp_servers.test.env]\nTOKEN = "private-value', encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"line 2, column") as caught:
+        launch_args.read_codex_mcp_servers(tmp_path, None, codex_version=(0, 154, 0))
+
+    diagnostic = "".join(traceback.format_exception(caught.value))
+    assert str(config_path) in diagnostic
+    assert "UnexpectedEofError" in diagnostic
+    assert "private-value" not in diagnostic
+
+
+async def test_cold_start_rejects_shared_home_before_modifying_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir(mode=0o755)
+    config_path = source / "config.toml"
+    original = 'model = "keep"\n'
+    config_path.write_text(original, encoding="utf-8")
+    original_mode = stat.S_IMODE(source.stat().st_mode)
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    spawn = AsyncMock()
+    monkeypatch.setattr(app_server.asyncio, "create_subprocess_exec", spawn)
+    server = _test_app_server(tmp_path, source, tmp_path / "bridge", tmp_path)
+
+    with pytest.raises(ValueError, match="Please report this as a bug"):
+        await server.start()
+
+    assert config_path.read_text(encoding="utf-8") == original
+    assert stat.S_IMODE(source.stat().st_mode) == original_mode
     spawn.assert_not_called()
 
 
