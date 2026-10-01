@@ -9,7 +9,7 @@ export function RunningDot({ className }: { className?: string }) {
       aria-hidden
       role="presentation"
       data-testid="running-dot"
-      className={cn("inline-flex size-3 shrink-0 animate-spin text-muted-foreground", className)}
+      className={cn("flex size-3 shrink-0 animate-spin text-muted-foreground", className)}
     >
       <Loader2Icon className="size-full" />
     </span>
