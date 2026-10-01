@@ -69,7 +69,12 @@ import {
   useInstallingHarnesses,
   type Host,
 } from "@/hooks/useHosts";
-import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import {
+  fetchAgentCatalog,
+  useAvailableAgents,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
+import { installAgentBundle } from "@/lib/agentsApi";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
@@ -206,7 +211,9 @@ vi.mock("@/components/ui/toast", () => ({ showToast: showToastMock }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
+  fetchAgentCatalog: vi.fn(),
 }));
+vi.mock("@/lib/agentsApi", () => ({ installAgentBundle: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
@@ -8607,6 +8614,46 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     expect(agentPicker).toHaveAccessibleName(/Claude Code/);
     fireEvent.pointerDown(agentPicker, { button: 0 });
     expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();
+  });
+
+  it("hides Import bundle on a server without agent install", async () => {
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+    await screen.findByTestId("create-agent-dialog");
+    expect(screen.queryByTestId("create-agent-import")).toBeNull();
+  });
+
+  it("imports a bundle and selects it from the refreshed catalog", async () => {
+    // The merged picker query may still be waiting on sessions; selection must
+    // come from the catalog the import refetches, not the merged cache.
+    const orion: AvailableAgent = {
+      id: "ag_orion",
+      name: "orion",
+      display_name: "Orion",
+      description: null,
+      harness: "claude-sdk",
+      skills: [],
+      installed: true,
+    };
+    vi.mocked(installAgentBundle).mockResolvedValue({ id: "ag_orion", name: "orion" });
+    vi.mocked(fetchAgentCatalog).mockResolvedValue([...DEFAULT_LANDING_AGENTS, orion]);
+    mockAgents([...DEFAULT_LANDING_AGENTS, orion]);
+    renderLanding({ agent_install: true });
+
+    const agentPicker = screen.getByTestId("new-chat-landing-agent-select");
+    fireEvent.pointerDown(agentPicker, { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+    await screen.findByTestId("create-agent-dialog");
+    fireEvent.change(screen.getByTestId("create-agent-import-input"), {
+      target: { files: [new File([new Uint8Array([0x1f, 0x8b])], "orion.tar.gz")] },
+    });
+
+    await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
+    expect(fetchAgentCatalog).toHaveBeenCalled();
+    await waitFor(() => expect(agentPicker).toHaveAccessibleName(/Orion/));
   });
 
   // Switch the target to the connected host, then create + submit a pending

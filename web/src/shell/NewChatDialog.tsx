@@ -254,6 +254,7 @@ import {
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import {
+  fetchAgentCatalog,
   useAvailableAgents,
   prefetchAvailableAgentDetails,
   type AvailableAgent,
@@ -7015,17 +7016,34 @@ export function NewChatLandingScreen() {
           setPendingAgent(input);
           handleSelectPending();
         }}
-        onImport={async (bundle) => {
-          const installed = await installAgentBundle(bundle);
-          // Refetch the picker so the install shows beside the built-ins, then pick it.
-          await queryClient.invalidateQueries({ queryKey: ["available-agents-catalog"] });
-          await queryClient.invalidateQueries({ queryKey: ["available-agents"] });
-          const agent = queryClient
-            .getQueriesData<AvailableAgent[]>({ queryKey: ["available-agents"] })
-            .flatMap(([, rows]) => rows ?? [])
-            .find((a) => a.id === installed.id);
-          if (agent) handleSelectAgent(agent);
-        }}
+        onImport={
+          info !== "loading" && info.agent_install === true
+            ? async (bundle) => {
+                const installed = await installAgentBundle(bundle);
+                try {
+                  // The catalog is authoritative even while the merged picker
+                  // query is still waiting on sessions; refresh both, pick from it.
+                  const catalog = await queryClient.fetchQuery({
+                    queryKey: ["available-agents-catalog"],
+                    queryFn: fetchAgentCatalog,
+                    staleTime: 0,
+                  });
+                  void queryClient.invalidateQueries({ queryKey: ["available-agents"] });
+                  const agent = catalog.find((a) => a.id === installed.id);
+                  if (!agent) throw new Error("it is not in the agent list yet");
+                  handleSelectAgent(agent);
+                } catch (err) {
+                  const reason = err instanceof Error ? err.message : String(err);
+                  throw new Error(
+                    `Installed ${installed.name}, but couldn't select it: ${reason}`,
+                    {
+                      cause: err,
+                    },
+                  );
+                }
+              }
+            : undefined
+        }
       />
     </div>
   );

@@ -196,6 +196,8 @@ export interface ServerInfo {
    * backend (Electron, Firefox/Chromium).
    */
   dictation_available: boolean;
+  /** True when ``POST /v1/agents`` installs agent bundles; absent on older servers. */
+  agent_install?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -254,6 +256,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  agent_install: false,
   branding: null,
 };
 
@@ -355,6 +358,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          agent_install: data.agent_install === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

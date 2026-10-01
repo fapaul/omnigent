@@ -67,4 +67,24 @@ describe("CreateAgentDialog", () => {
     expect(onOpenChange).not.toHaveBeenCalled();
     expect(screen.getByTestId("create-agent-import")).not.toBeDisabled();
   });
+
+  it("locks Cancel and Create while an import is in flight", async () => {
+    let finish: () => void = () => {};
+    const onImport = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    renderDialog({ onImport });
+
+    fireEvent.change(screen.getByTestId("create-agent-import-input"), {
+      target: { files: [bundle] },
+    });
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled());
+    expect(screen.getByTestId("create-agent-submit")).toBeDisabled();
+    finish();
+    await waitFor(() => expect(screen.getByTestId("create-agent-import")).not.toBeDisabled());
+  });
 });

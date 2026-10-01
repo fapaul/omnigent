@@ -159,6 +159,8 @@ export function CreateAgentDialog({
   }
 
   function handleOpenChange(next: boolean) {
+    // Stay open while an import is in flight so its result lands somewhere.
+    if (!next && importing) return;
     if (!next) reset();
     onOpenChange(next);
   }
@@ -200,7 +202,8 @@ export function CreateAgentDialog({
     setImportError(null);
     try {
       await onImport(bundle);
-      handleOpenChange(false);
+      reset();
+      onOpenChange(false);
     } catch (err) {
       setImportError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -378,10 +381,14 @@ export function CreateAgentDialog({
               </Button>
             </>
           )}
-          <Button variant="ghost" onClick={() => handleOpenChange(false)}>
+          <Button variant="ghost" disabled={importing} onClick={() => handleOpenChange(false)}>
             Cancel
           </Button>
-          <Button data-testid="create-agent-submit" onClick={handleSubmit} disabled={!canSubmit}>
+          <Button
+            data-testid="create-agent-submit"
+            onClick={handleSubmit}
+            disabled={!canSubmit || importing}
+          >
             Create
           </Button>
         </DialogFooter>

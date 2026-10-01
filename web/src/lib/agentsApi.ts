@@ -1,4 +1,5 @@
 import { authenticatedFetch } from "@/lib/identity";
+import { apiErrorFromResponse } from "@/lib/sessionsApi";
 
 /** An agent installed with {@link installAgentBundle}. */
 export interface InstalledAgent {
@@ -19,10 +20,10 @@ export async function installAgentBundle(bundle: File): Promise<InstalledAgent> 
   const form = new FormData();
   form.append("bundle", bundle, bundle.name);
   const res = await authenticatedFetch("/v1/agents", { method: "POST", body: form });
-  const body = (await res.json().catch(() => null)) as
-    (InstalledAgent & { error?: { message?: string }; detail?: string }) | null;
-  if (!res.ok || body == null) {
-    throw new Error(body?.error?.message ?? body?.detail ?? `${res.status} ${res.statusText}`);
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  const body = (await res.json().catch(() => null)) as Partial<InstalledAgent> | null;
+  if (typeof body?.id !== "string" || typeof body.name !== "string") {
+    throw new Error("Unexpected response from the server when installing the agent.");
   }
   return { id: body.id, name: body.name };
 }
